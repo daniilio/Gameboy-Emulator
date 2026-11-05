@@ -1,8 +1,19 @@
+mod emulator;
+mod execution;
+mod graphics;
+mod instructions;
+mod memory;
+mod registers;
+
 use std::fs;
 use std::io::Read;
 use std::fs::File;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering}
+}
 
-const CARTRIDGE_SIZE: usize = 0x200000;
+use crate::emulator::{load_rom, run}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -10,20 +21,17 @@ fn main() {
         println!("ERROR: No game ROM provided");
         return;
     }
+    let game_path = PathBuf::from(&args[1]);
+    load_rom(&game_path);
 
-    let mut cartridge_memory = [0u8; CARTRIDGE_SIZE];
+    let game_name = game_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .expect("Invalid game file name");
 
-    let game_path = &args[1];
-    let mut file = File::open(&game_path).expect("ERROR: Failed to open game ROM");
+    // TODO: Cleanup battery backed RAM thread on shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
     
-    let mut bytes_read: usize = 0;
-    while bytes_read < CARTRIDGE_SIZE {
-        let b = file.read(&mut cartridge_memory[bytes_read..]).expect("ERROR: Failed to read game ROM");
-        if b == 0 {
-            // EOF
-            break;
-        }
-        bytes_read += b;
-    }
-    drop(file);
+
+    run();
 }

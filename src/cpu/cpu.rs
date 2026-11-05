@@ -1,34 +1,41 @@
-mod registers;
+use crate::instructions::*;
+use crate::cpu_registers::CPU_Registers;
+use crate::bus::MemoryBus;
 
-use registers::Registers;
-use bus::MemoryBus;
+// Zero-page jump vectors
+RST_VECTORS = {0000, 0008, 0010, 0018, 0020, 0028, 0030, 0038}
 
 struct CPU {
-    regs: Registers,
+    regs: CPU_Registers,
     pc: u16,
     bus: MemoryBus,
     halt: bool,
 }
 
 impl CPU {
-    fn execute(&mut self) {
+    /// Executes the opcode addressed by CPU::pc.
+    ///
+    /// Returns the number of clock cycles consumed by the instruction.
+    pub fn execute(&mut self) -> u8 {
         if (self.halt) {
             return;
         }
-
+        
         let opcode = self.bus.read_byte(self.pc);
-
-        let instruct: Instruction;
+        
+        let instruction: Instruction;
         if opcode == 0xCB {
             // Prefix instruction
             opcode = self.bus.read_byte(self.pc + 1);
-            instruct = Self::match_prefix_opcode(opcode);
+            instruction = Self::match_prefix_opcode(opcode);
         } else {
             // Non-prefix instruction
-            instruct = Self::match_opcode(opcode);
+            instruction = Self::match_opcode(opcode);
         }
-
-        self.pc = self.execute_instruction(instruct);
+        
+        self.pc = self.execute_instruction(instruction);
+        
+        // TODO: execute needs to return the number of cycles consumed by the processed opcode
     }
 
     fn match_opcode(opcode: u8) -> Instruction {
