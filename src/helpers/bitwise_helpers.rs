@@ -33,18 +33,3 @@ pub fn set_bit(word: &mut u16, position: u8, value: bool) {
         *word &= !(1u16 << position);
     }
 }
-
-pub fn read_file(file_path: PathBuf, buffer: &mut [u8]) -> io::Result<usize>
-{
-    let mut file = File::open(file_path)?;
-    let mut bytes_read = 0;
-    while bytes_read < buffer.len() {
-        let b = file.read(&mut buffer[bytes_read..])?;
-        if b == 0 {
-            break; // EOF
-        }
-        bytes_read += b;
-    }
-
-    Ok(bytes_read)
-}

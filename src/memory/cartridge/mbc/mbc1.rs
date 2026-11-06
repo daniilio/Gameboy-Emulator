@@ -15,67 +15,37 @@ const BANK_MODE_SELECT_BEGIN: u16 = 0x6000;
 const BANK_MODE_SELECT_END:   u16 = 0x7FFF;
 
 pub struct MemoryBankController1 {
-    game_name: String,
-    save_thread: Option<JoinHandle<()>>,
-
-    // MBC control registers
+    // MBC1 control registers
     ram_enabled: bool,
     bank_mode: bool,
     rom_bank_select: u8,
     upper_bank_select: u8,
-    
-    // Header data
-    battery_backed: bool,
 
-    // External
     cartridge_rom: Vec<u8>,
     cartridge_ram: Arc<Mutex<Vec<u8>>>,
 }
 
 impl MemoryBankController1 {
     pub fn new(
-        game_name: String, 
-        shutdown: &Arc<AtomicBool>,
-        battery_backed: Bool,
         cartridge_rom: Vec<u8>, 
-        cartridge_ram: Vec<u8>
+        cartridge_ram: Arc<Mutex<Vec<u8>>>,
     ) -> Self
     {
-        let cartridge_ram = Arc::new(Mutex::new(cartridge_ram));
-        
-        // Spin up battery backed RAM thread
-        let thread_shutdown = Arc::clone(shutdown);
-        let save_thread = thread::spawn(|| {
-            while !thread_shutdown.load(Ordering::Relaxed) {
-                thread::sleep(SAVE_INTERVAL);
-                if let Err(err) = self.persist_ram() {
-                    eprintln!("Failed to persist cartridge RAM: {}", err);
-                }
-            }
-        });
-
-        let mut mbc = Self {
-            game_name,
-            save_thread,
-
+        Self {
             ram_enabled: false,
             bank_mode: false,
             rom_bank_select: 0x01,
             upper_bank_select: 0x00,
 
-            battery_backed,
-
             cartridge_rom,
             cartridge_ram,
-        };
-
-        mbc
+        }
     }
 
     /// Returns a bitmask for the ROM bank number, based on the cartridge
     /// ROM size.
-    /// Note that a non-power-of-two ROM size may include bank numbers 
-    /// that do not correspond to a valid bank.
+    /// Note that a non-power-of-two ROM size may include invalid bank 
+    // numbers.
     fn rom_bank_mask(&self) -> usize 
     {
         let mut bank_count = self.cartridge_rom.len() / ROM_BANK_SIZE;
@@ -87,22 +57,19 @@ impl MemoryBankController1 {
 }
 
 impl MemoryBankController for MemoryBankController1 {
-    // TODO: Parse the cartridge header
     // TODO: Add support for 1 MiB multi-game compilation carts
-    
     fn read_byte(&self, addr: u16) -> u8
     {
         match addr {
             ROM_BANK_0_BEGIN ..= ROM_BANK_0_END => {
-                let cart_addr: usize;
-                if self.bank_mode {
+                let cart_addr = if self.bank_mode {
                     let mut rom_bank = (self.upper_bank_select as usize) << 5;
                     rom_bank &= self.rom_bank_mask();
 
-                    cart_addr = (rom_bank << 14) | (addr as usize);
+                    (rom_bank << 14) | (addr as usize)
                 } else {
-                    cart_addr = (addr as usize);
-                }
+                    (addr as usize)
+                };
                 
                 if cart_addr < self.cartridge_rom.len() {
                     self.cartridge_rom[cart_addr]

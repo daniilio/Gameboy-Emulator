@@ -81,7 +81,7 @@ impl PixelLine {
 }
 
 
-struct PPU {
+struct PictureProcessingUnit {
     vram: [u8; VRAM_END - VRAM_BEGIN + 1],
     oam: [u8; OAM_END - OAM_BEGIN + 1],
 
@@ -96,7 +96,7 @@ struct PPU {
     window: Window,
 }
 
-impl PPU {
+impl PictureProcessingUnit {
     pub fn new() -> Self 
     {
         let window = Window::new(

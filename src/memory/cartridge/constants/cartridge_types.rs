@@ -1,4 +1,4 @@
-// Cartridge types
+// Cartridge type codes
 const ROM_ONLY: u8 = 0x00;
 
 const MBC1: u8 = 0x01;

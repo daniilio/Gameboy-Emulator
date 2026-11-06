@@ -2,3 +2,5 @@
 .vscode/
 *.rs.bk
 .DS_Store
+*.gb
+*.sav

@@ -1,18 +1,24 @@
 use crate::instructions::*;
-use crate::cpu_registers::CPU_Registers;
+use crate::cpu_registers::CPURegisters;
 use crate::bus::MemoryBus;
 
 // Zero-page jump vectors
 RST_VECTORS = {0000, 0008, 0010, 0018, 0020, 0028, 0030, 0038}
 
 struct CPU {
-    regs: CPU_Registers,
+    regs: CPURegisters,
     pc: u16,
     bus: MemoryBus,
     halt: bool,
 }
 
 impl CPU {
+    pub fn new() -> Self
+    {
+        // TODO: Complete CPU constructor
+        self.pc = 0x0000;
+    }
+
     /// Executes the opcode addressed by CPU::pc.
     ///
     /// Returns the number of clock cycles consumed by the instruction.

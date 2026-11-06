@@ -1,14 +1,12 @@
 use crate::helpers::*;
 
-
 // Flags register bits
 const ZERO_POSITION: u8 = 7;
 const SUBTRACT_POSITION: u8 = 6;
 const HALF_CARRY_POSITION: u8 = 5;
 const CARRY_POSITION: u8 = 4;
 
-
-pub struct CPU_Registers {
+pub struct CPURegisters {
     af: u16,
     bc: u16,
     de: u16,
@@ -16,7 +14,7 @@ pub struct CPU_Registers {
     sp: u16,
 }
 
-impl CPU_Registers {
+impl CPURegisters {
     pub fn get_a(&self) -> u8 {
         get_msb(self.af)
     }

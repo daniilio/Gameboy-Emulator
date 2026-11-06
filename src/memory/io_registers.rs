@@ -1,9 +1,4 @@
-use crate::memory::memory_bus::{IO_REGISTERS_BEGIN, IO_REGISTERS_END};
-
-const OAM_DMA_CONTROL_REGISTER: u16 = 0xFF46;
-const BOOT_ROM_REGISTER: u16 = 0xFF50;
-
-const DMA_WRITE: 
+// TODO: Complete IO_Registers: Since we're scattering some of the registers around, we can complete the rest later
 
 pub struct IO_Registers {
     io_registers: [u8; IO_REGISTERS_END - IO_REGISTERS_BEGIN + 1],
