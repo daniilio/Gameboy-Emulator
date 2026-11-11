@@ -1,10 +1,10 @@
-// TODO: Complete IO_Registers: Since we're scattering some of the registers around, we can complete the rest later
+// TODO: Complete IORegisters: Since we're scattering some of the registers around, we can complete the rest later
 
-pub struct IO_Registers {
+pub struct IORegisters {
     io_registers: [u8; IO_REGISTERS_END - IO_REGISTERS_BEGIN + 1],
 }
 
-impl IO_Registers {
+impl IORegisters {
     /// Returns whether the boot ROM register is toggled in bit 0.
     /// This indicates whether Boot ROM is mapped
     pub fn is_boot_rom_mapped(&self) -> bool

@@ -3,8 +3,8 @@ const RAM_NONE: u8 = 0x00;
 const RAM_UNUSED: u8 = 0x01;
 const RAM_8_KIB: u8 = 0x02;
 const RAM_32_KIB: u8 = 0x03;
-const RAM_128_KIB: u8 = 0x04;
 const RAM_64_KIB: u8 = 0x05;
+const RAM_128_KIB: u8 = 0x04;
 
 pub fn get_ram_size(ram_code: u8) -> usize {
     match ram_code {

@@ -18,7 +18,7 @@ const CARTRIDGE_RAM_SIZE:     usize = (CARTRIDGE_RAM_END - CARTRIDGE_RAM_BEGIN +
 const WRAM_BEGIN:             u16 = 0xC000;
 const WRAM_END:               u16 = 0xDFFF;
 const WRAM_SIZE:              usize = (WRAM_END - WRAM_BEGIN + 1) as usize;
-
+x
 const ECHO_RAM_BEGIN:         u16 = 0xE000;
 const ECHO_RAM_END:           u16 = 0xFDFF;
 const ECHO_RAM_SIZE:          usize = (ECHO_RAM_END - ECHO_RAM_BEGIN + 1) as usize;
