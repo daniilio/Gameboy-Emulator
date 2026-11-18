@@ -4,6 +4,7 @@ mod graphics;
 mod instructions;
 mod memory;
 mod registers;
+mod helpers;
 
 use std::fs;
 use std::io::Read;

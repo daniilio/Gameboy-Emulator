@@ -1,5 +1,8 @@
 use minifb::{Window, WindowOptions};
 
+use crate::memory::constants::memory_map::*;
+use crate::helpers::bitwise::*;
+
 // Register addresses
 const LCDC: u16 = 0xFF40;  // LCD control
 const STAT: u16 = 0xFF41;  // STAT: LCD status
@@ -10,6 +13,8 @@ const LYC: u16 = 0xFF45;  // LY compare
 const BGP: u16 = 0xFF47;  // Background palette data
 const OBP0: u16 = 0xFF48;  // OBJ palette 0
 const OBP1: u16 = 0xFF49; // OBJ palette 1
+const WY: u16 = 0xFF4A;  // Window Y-coordinate
+const WX: u16 = 0xFF4B;  // Window X-coordinate
 
 // LCDC register
 const LCD_ENABLE: u8                              = 7;
@@ -50,12 +55,13 @@ const FB_DARK_GRAY: u32 = 0x346856;
 const FB_BLACK: u32 = 0x081820;
 
 // Screen dimensions
-const FRAME_BUFFER_DIM: usize = 256;  // 256x256 pixels frame buffer
+const BUFFER_DIM: usize = 256;  // 256x256 pixels frame buffer
 const SCREEN_DIM_X: usize = 160;  // 160x144 pixel window into frame buffer
 const SCREEN_DIM_Y: usize = 144;
 
 // Tiles
-const TILE_DIM: usize = 8;  // 8x8 pixel tile
+const TILE_DIM: u8 = 8;  // 8x8 pixel tile
+const TILE_SIZE: u8 = 16;  // 16 byte tile
 const TILES_PER_SCREEN_AXIS: usize = FRAME_BUFFER_DIM / TILE_DIM;  // 32x32 tiles in frame buffer
 
 // STAT register
@@ -76,53 +82,48 @@ const X_FLIP: u8 = 5;
 const PALETTE: u8 = 4;
 
 struct Object {
-    // Top-left position
-    x: u8,
-    y: u8,
-
-    // False=8x8 or True=8x16 mode
-    sprite_mode: bool,
-
-    tile_idx: u8,
-
-    // Flags
+    x: i16,
+    y: i16,
+    tile_id: u8,
     priority: bool,
     y_flip: bool,
     x_flip: bool,
-    palette: bool,
+    palette: u8,
 }
 
 pub struct PictureProcessingUnit {
-    // Remaining clock cycles in the current PPU mode
+    // Remaining clock cycles in the current PPU mode.
     remaining_clock_cycles: u16,
-
-    // Object IDs found in mode 0
-    objects_present: Vec<Object>,
+    // Complete the work for a PPU mode all at once (irregardless of timing). 
+    // Then wait through remaining clock cycles.
+    wait: bool,
+    // Object IDs found in mode 0.
+    objects_in_scanline: Vec<Object>,
+    interrupt_controller: InterruptController,
+    // Previous STAT interrupt signal. STAT interrupt is edge triggerred.
+    stat_signal: bool,
 
     vram: [u8; VRAM_SIZE],
     oam: [u8; OAM_SIZE],
 
-    // LCD/PPU control registers
+    // LCD/PPU control registers.
     lcdc: u8,
     stat: u8,
     scy: u8,
     scx: u8,
     ly: u8,
     lyc: u8,
+    wy: u8,
+    wx: u8,
 
-    // Palette registers
+    // Palette registers.
     bgp: u8,
     obp0: u8,
     obp1: u8,
 
-    // Rendering and display
-    frame_buffer: [u32; SCREEN_BUFFER_DIM * SCREEN_BUFFER_DIM],
-    window_buffer: [u32; SCREEN_DIM_X * SCREEN_DIM_Y],
+    // Rendering and display.
+    screen_buffer: [[u32; SCREEN_DIM_X]; SCREEN_DIM_Y],
     window: Window,
-
-    interrupt_controller: InterruptController,
-    // The STAT interrupt needs to be edge trigerred
-    stat_signal: bool,
 }
 
 impl PictureProcessingUnit {
@@ -142,7 +143,7 @@ impl PictureProcessingUnit {
         }
     }
 
-    pub read_byte(&self, addr: u16) -> u8 
+    pub fn read_byte(&self, addr: u16) -> u8 
     {
         match addr {
             VRAM_BEGIN ..= VRAM_END => {
@@ -190,11 +191,17 @@ impl PictureProcessingUnit {
             OBP1 => {
                 self.obp1
             }
+            WY => {
+                self.wy
+            }
+            WX => {
+                self.wx
+            }
             _ => 0xFF
         }
     }
 
-    pub write_byte(&mut self, addr: u16, value: u8)
+    pub fn write_byte(&mut self, addr: u16, value: u8)
     {
         match addr {
             VRAM_BEGIN ..= VRAM_END => {
@@ -240,170 +247,391 @@ impl PictureProcessingUnit {
             OBP1 => {
                 self.obp1 = value;
             }
+            WY => {
+                self.wy = value;
+            }
+            WX => {
+                self.wx = value;
+            }
             _ => {}
         }
     }
 
-    /// Converts pixel position to the frame buffer index.
-    ///
-    /// # Arguments
-    /// * `tile_idx` - Index of the tile in tile map.
-    /// * `pixel_line` - Line (y-coordinate) within the tile.
-    /// * `pixel_idx` - Index (x-coordinate) within the tile.
-    fn to_fb_index(tile_idx: u8, pixel_line: u8, pixel_idx: u8) -> usize
+    fn ppu_mode(&self) -> u8
     {
-        let tile_idx = tile_idx as usize;
-        let pixel_line = pixel_line as usize;
-        let pixel_idx = pixel_idx as usize;
-
-        let x = pixel_idx + (tile_idx % TILES_PER_SCREEN_AXIS) * TILE_DIM;
-        let y = pixel_line + (tile_idx / TILES_PER_SCREEN_AXIS) * TILE_DIM;
-
-        x + y * SCREEN_BUFFER_DIM
+        self.stat & 0x03
     }
 
-    /// Converts a Gameboy color value to a frame buffer
-    /// color value used by the emulator.
-    fn to_fb_color(gb_color: u8) -> u32
+    fn lcd_enable(&self) -> bool {
+        is_bit_set(self.lcdc, LCD_ENABLE)
+    }
+    
+    fn window_tile_map_select(&self) -> bool {
+        is_bit_set(self.lcdc, WINDOW_TILE_MAP_SELECT)
+    }
+    
+    fn window_enable(&self) -> bool {
+        is_bit_set(self.lcdc, WINDOW_ENABLE)
+    }
+    
+    fn background_and_window_tile_data_select(&self) -> bool {
+        is_bit_set(self.lcdc, BACKGROUND_AND_WINDOW_TILE_DATA_SELECT)
+    }
+    
+    fn background_tile_map_select(&self) -> bool {
+        is_bit_set(self.lcdc, BACKGROUND_TILE_MAP_SELECT)
+    }
+    
+    fn obj_size(&self) -> bool {
+        is_bit_set(self.lcdc, OBJ_SIZE)
+    }
+    
+    fn obj_enable(&self) -> bool {
+        is_bit_set(self.lcdc, OBJ_ENABLE)
+    }
+    
+    fn background_and_window_enable(&self) -> bool {
+        is_bit_set(self.lcdc, BACKGROUND_AND_WINDOW_ENABLE)
+    }
+
+    /// Given a palette and colour ID, returns a 32-bit colour value.
+    fn colour(colour_id: u8, palette: u8) -> u32
     {
-        match gb_color {
+        let shift = colour_id * 2;
+        let gb_colour = palette >> shift & 0x03;
+
+        match gb_colour {
             GB_WHITE => FB_WHITE,
             GB_LIGHT_GRAY => FB_LIGHT_GRAY,
             GB_DARK_GRAY => FB_DARK_GRAY,
             GB_BLACK => FB_BLACK,
+            _ => panic!(Invalid Game Boy Colour!),
         }
     }
 
-    /// Maps the palette register to an array.
-    /// 
-    /// The array is indexed by ID, with color value elements.
-    fn palette_map(palette: u8) -> [u8; 4]
-    {
-        let mut map = [u8; 4];
-        let mask = 0x03;
-        map[0] = palette & mask;
-        map[1] = (palette >> 2) & mask;
-        map[2] = (palette >> 4) & mask;
-        map[3] = (palette >> 6) & mask;
-
-        map
-    }
-
     /// Get the address of the tile with given tile id.
-    ///
-    /// # Arguments
-    /// * `tile_id` - The ID of the tile.
-    fn tile_addr(&self, tile_id: u8) -> u16
+    fn tile_vram_addr(&self, tile_id: u8) -> u16
     {
-        if is_bit_set(self.lcdc, BACKGROUND_AND_WINDOW_TILE_DATA_SELECT) {
+        if self.background_and_window_tile_data_select() {
             // Tile data block 0 and block 1 selected
-            TILE_DATA_0_BEGIN + (tile_id as u16)
+            TILE_DATA_0_BEGIN + (tile_id as u16) - VRAM_BEGIN
         } else {
             // Tile data block 1 and block 2 selected
             match tile_id {
                 0 ..= 127 => {
-                    TILE_DATA_2_BEGIN + (tile_id as u16)
+                    TILE_DATA_2_BEGIN + (tile_id as u16) - VRAM_BEGIN
                 }
                 128 ..= 255 => {
-                    TILE_DATA_1_BEGIN + ((tile_id - 128) as u16)
+                    TILE_DATA_1_BEGIN + ((tile_id - 128) as u16) - VRAM_BEGIN
                 }
             }
         }
     }
 
-    /// Render a tile.
-    ///
-    /// # Arguments
-    /// * `tile_id` - ID of tile in tile data block.
-    /// * `tile_idx` - Index of tile in tile map.
-    /// * `palette` - Palette register value.
-    fn render_tile(&mut self, tile_id: u8, tile_idx: usize, palette: u8)
+    /// Returns the colour ID of a pixel in the tile map.
+    fn pixel_id(&self, tile_map_addr: u16, x: u8, y: u8) -> u8
     {
-        let mut cur_addr = self.tile_addr(tile_id);
-        let palette_map = Self::palette_map(palette);
+        // Index of the tile in the tile map.
+        let tile_idx = 
+            (y / TILE_DIM) * ((BUFFER_DIM / (TILE_DIM as usize)) as u8) + 
+            (x / TILE_DIM);
+        // Address of the tile in the tile map block.
+        let addr = tile_map_addr + tile_idx as u16;
         
-        // Each horizontal line of pixels is 2 bytes
-        // First byte specifies least significant bit of color ID
-        // Second byte specifies most significant bit of color ID
-        // Bit 7 is the leftmost pixel, and bit 0 is the rightmost
-        for line in 0..8 {
-            // Process horizontal line
-            for idx in 0..8 {
-                // Process pixels left to right
-                let ls_bit = is_bit_set(self.vram[cur_addr as usize], (7 - idx)) as u8;
-                let ms_bit = is_bit_set(self.vram[cur_addr.wrapping_add(1) as usize], (7 - idx)) as u8;
-                let color_id = (ms_bit << 1) | ls_bit;
+        // ID of the tile in tile data block.
+        let tile_id = self.vram[addr as usize];
+        // Address of the tile in the tile data block.
+        let tile_addr = self.tile_vram_addr(tile_id);
 
-                // Map color ID to color specified by palette
-                let gb_color = palette_map[color_id];
-                let fb_color = Self::to_fb_color(gb_color);
+        // x and y positions within the tile.
+        let tile_x = x % TILE_DIM;
+        let tile_y = y % TILE_DIM;
 
-                // Pixel index in the screen buffer
-                let fb_pixel_idx = Self::to_fb_index(tile_idx, line, idx);
+        // Each row of the tile is 2 bytes.
+        let pixel_addr = (tile_addr + (tile_y as u16) * 2) as usize;
 
-                // Draw pixel to the screen
-                self.frame_buffer[fb_pixel_idx] = fb_color;
-            }
-            cur_addr = cur_addr.wrapping_add(2);
-        }
+        let ls_bit = (self.vram[pixel_addr] >> (7 - tile_x)) & 1;
+        let ms_bit = 
+            (self.vram[pixel_addr.wrapping_add(1)] >> (7 - tile_x)) & 1;
+        let colour_id = (ms_bit << 1) | ls_bit;
+
+        colour_id
     }
 
-    fn render(&mut self, base_addr: u16)
+    /// Returns the color ID of specified pixel in the background.
+    /// Coordinates are relative to the tile map.
+    fn background_pixel_id(&self, x: u8, y: u8) -> u8
     {
-        for idx in 0..TILE_MAP_BLOCK_SIZE {
-            let tile_id = self.vram[(base_addr as usize) + idx];
-            self.render_tile(tile_id, idx);
-        }
-    }
-
-    fn render_background(&mut self)
-    {
-        let base_addr = if is_bit_set(self.lcdc, BACKGROUND_TILE_MAP_SELECT) {
-            // Render background from tile map 1
+        // Base address of the tile map
+        let tile_map_addr = if self.background_tile_map_select() {
             TILE_MAP_1_BEGIN
         } else {
-            // Render background from tile map 0
             TILE_MAP_0_BEGIN
         };
-        self.render(base_addr);
+        self.pixel_id(tile_map_addr, x, y)
     }
 
-    fn render_window(&mut self)
+    /// Returns the colour ID of specified pixel in the window.
+    /// Coordinates are relative to the tile map.
+    fn window_pixel_id(&self, x: u8, y: u8) -> u8
     {
-        let base_addr = if is_bit_set(self.lcdc, WINDOW_TILE_MAP_SELECT) {
+        let tile_map_addr = if self.window_tile_map_select() {
             // Render window from tile map 1
             TILE_MAP_1_BEGIN
         } else {
             // Render window from tile map 0
             TILE_MAP_0_BEGIN
         };
-        self.render(base_addr);
+        self.pixel_id(tile_map_addr, x, y)
     }
 
-    fn render_object(&mut self)
+    /// Returns the colour ID of specified pixel in the object.
+    /// Coordinates are relative to the object.
+    fn object_pixel_id(&self, obj: &Object, x: u8, y: u8) -> u8
     {
+        // Address of the tile in the tile data block.
+        let tile_addr = 
+            TILE_DATA_0_BEGIN + obj.tile_id as u16 - VRAM_BEGIN;
 
+        // x and y positions within the tile.
+        let mut tile_x = x % TILE_DIM;
+        let mut tile_y = y % TILE_DIM;
+        
+        if obj.x_flip {
+            tile_x = 7 - tile_x;
+        }
+        if obj.y_flip {
+            tile_y = 7 - tile_y;
+        }
+
+        // Each row of the tile is 2 bytes.
+        let pixel_addr = tile_addr + (tile_y as u16) * 2;
+
+        let ls_bit = (self.vram[pixel_addr as usize] >> (7 - tile_x)) & 1;
+        let ms_bit = 
+            (self.vram[(pixel_addr as usize).wrapping_add(1)] >> (7 - tile_x)) & 1;
+        let colour_id = (ms_bit << 1) | ls_bit;
+
+        colour_id
     }
 
-    fn copy_to_window(&mut self)
+    /// PPU mode 2. Save objects present in the current scanline.
+    fn mode2(&mut self)
     {
+        // Save objects present in this scanline
+        self.objects_in_scanline.clear();
+        for id in 0..OBJECT_COUNT {
+            // Gameboy only draws up to 10 objects
+            if self.objects_in_scanline.len() == 10 {
+                break;
+            }
+            
+            // Get object attributes
+            let addr = (OAM_BEGIN as usize) + ((id * 4) as usize);
+            let y_screen = (self.oam[addr] as i16) - 16;
+            let x_screen = (self.oam[addr.wrapping_add(1)] as i16) - 8;
+            let tile_id = if self.obj_size() {
+                // 8x16 must be aligned to two tiles
+                self.oam[addr.wrapping_add(2)] & 0xFE
+            } else {
+                // 8x8
+                self.oam[addr.wrapping_add(2)]
+            };
+            let priority = is_bit_set(
+                self.oam[addr.wrapping_add(3)], 
+                PRIORITY
+            );
+            let y_flip = is_bit_set(
+                self.oam[addr.wrapping_add(3)], 
+                Y_FLIP
+            );
+            let x_flip = is_bit_set(
+                self.oam[addr.wrapping_add(3)], 
+                X_FLIP
+            );
+            let palette = 
+                if is_bit_set(
+                    self.oam[addr.wrapping_add(3)], 
+                    PALETTE
+                ) {
+                self.obp1
+            } else {
+                self.obp0
+            };
 
+            let obj = Object {
+                x: x_screen,
+                y: y_screen,
+                tile_id,
+                priority,
+                y_flip,
+                x_flip,
+                palette,
+            };
+
+            // Check if sprite is 8x8 or 8x16
+            let offset = if self.obj_size() {
+                16
+            } else {
+                8
+            };
+
+            // Check if the object intersects the scanline
+            if y_screen <= self.ly && self.ly < y_screen + offset {
+                self.present_objects.push(obj);
+            }
+        }
     }
-    
-    pub fn render(&mut self) 
-    {  
-        // Request STAT interrupt if the stat signal goes low to high
-        let mode = self.stat & 0x03;
-        let new_stat_signal = (is_bit_set(self.stat, MODE_0_SELECT) && mode == 0) ||
+
+    /// PPU mode 3. Render and display the scanline.
+    fn mode3(&mut self)
+    {
+        for i in 0..SCREEN_DIM_X {
+            let mut colour: u32;
+
+            // x and y coordinate of pixel in tile map.
+            let x = 
+                ((self.scx as u16 + i as u16) % (BUFFER_DIM as u16)) as u8;
+            let y = 
+                ((self.scy as u16 + self.ly as u16) % (BUFFER_DIM as u16)) as u8;
+
+            let mut colour_id = 0;
+            if self.background_and_window_enable() {
+                // WX register is x position plus 7.
+                let window_x = i as i16 - (self.wx as i16 - 7);
+                let window_y = self.ly as i16 - self.wy as i16;
+                
+                // Check that screen coordinates are in the window area.
+                if self.window_enable() && 
+                    window_x >= 0 &&
+                    window_y >= 0 {
+
+                    colour_id = 
+                        self.window_pixel_id(window_x as u8, window_y as u8);
+                } else {
+                    colour_id = self.background_pixel_id(x, y);
+                }
+            }
+            colour = Self::colour(colour_id, self.bgp);
+
+            // Check if any sprites overwrite this pixel.
+            // Largest possible x-coordinate origin for an object (255 - 8).
+            let mut prev_obj_x: i16 = 247;
+            // Largest possible tile ID for an object.
+            let mut prev_obj_id: u8 = 255;
+            for obj in &self.objects_in_scanline {
+                if obj.priority && colour_id != 0 {
+                    // Object is behind nonzero background/window colour IDs.
+                    continue;
+                }
+
+                // Check whether the sprite overlaps this pixel.
+                let offset = if self.obj_size() {
+                    // 8x16 sprites.
+                    16
+                } else {
+                    // 8x8 sprites.
+                    8
+                };
+                if !(obj.x <= (x as i16) && (x as i16) < obj.x + 8 && 
+                    obj.y <= (self.ly as i16) && (self.ly as i16) < obj.y + offset) {
+                    continue;
+                }
+
+                let obj_colour_id = self.object_pixel_id(
+                        obj, 
+                        (x as i16 - obj.x) as u8, 
+                        (y as i16 - obj.y) as u8
+                );
+
+                if obj_colour_id == 0 {
+                    continue;
+                }
+
+                // Leftmost object has priority. If there's a tie, break it by 
+                // prioritizing lowest tile ID.
+                if obj.x < prev_obj_x {
+                    colour_id = obj_colour_id;
+                    colour = Self::colour(colour_id, obj.palette);
+
+                    prev_obj_x = obj.x;
+                    prev_obj_id = obj.tile_id;
+                } else if obj.x == prev_obj_x && 
+                    obj.tile_id <= prev_obj_id {
+
+                    colour_id = obj_colour_id;
+                    colour = Self::colour(colour_id, obj.palette);
+
+                    prev_obj_id = obj.tile_id;
+                }
+            }
+
+            self.screen_buffer[self.ly as usize][i] = colour;
+        }
+        
+        // Write scanline to screen buffer and output to display.
+        self.window.update_with_buffer(
+            self.screen_buffer.as_flattened(),
+            SCREEN_DIM_X,
+            SCREEN_DIM_Y,
+        ).unwrap();
+    }
+
+    fn cycles_per_mode(mode: u8) -> u16
+    {
+        // TODO: These are just baselines, need to include penalty calculation
+        match mode {
+            0 => 87,
+            1 => 4560,
+            2 => 80,
+            3 => 172,
+            _ => panic!("Invalid PPU mode!"),
+        }
+    }
+
+    fn wait_mode(&self, cycles: u8)
+    {
+        if self.remaining_clock_cycles <= cycles {
+            self.ppu_mode = (self.ppu_mode + 1) % 4;
+
+            let remaining_cycles =  cycles - self.remaining_clock_cycles;
+
+            self.remaining_clock_cycles = Self::cycles_per_mode(self.ppu_mode);
+
+            // Continue rendering for the number of remaining cycles
+            self.render(remaining_cycles);
+        } else {
+            self.remaining_clock_cycles -= cycles;
+        }
+    }
+
+    fn stat_interrupt(&mut self)
+    {
+        let mode = self.ppu_mode();
+        let stat_signal = 
+            (is_bit_set(self.stat, MODE_0_SELECT) && mode == 0) ||
             (is_bit_set(self.stat, MODE_1_SELECT) && mode == 1) ||
             (is_bit_set(self.stat, MODE_2_SELECT) && mode == 2) ||
             (is_bit_set(self.stat, LYC_SELECT) && self.lyc == self.ly);
-        if !self.stat_signal && new_stat_signal {
+        // Request STAT interrupt if the stat signal goes low to high.
+        if !self.stat_signal && stat_signal {
             self.interrupt_controller.request_interrupt();
         }
-        self.stat_signal = new_stat_signal;
+        self.stat_signal = stat_signal;
+    }
+    
+    pub fn render(&mut self, cycles: u8) 
+    {  
+        if cycles == 0 {
+            return;
+        }
+        if self.wait {
+            self.wait_mode(cycles);
+        }
 
-        match mode {
+        self.stat_interrupt();
+
+        match self.ppu_mode() {
             0 => {
 
             }
@@ -411,92 +639,13 @@ impl PictureProcessingUnit {
                 
             }
             2 => {
-                // Save objects present in this scanline
-                self.present_objects.clear();
-                for id in 0..OBJECT_COUNT {
-                    // Gameboy only draws up to 10 objects
-                    if self.present_objects.len() >= 10 {
-                        break;
-                    }
-                    
-                    // Get object attributes
-                    let addr = (OAM_BEGIN as usize) + (id as usize);
-                    let y_screen = (self.oam[addr] as i16) - 16;
-                    let x_screen = (self.oam[addr.wrapping_add(1)] as i16) - 8;
-                    let sprite_mode = is_bit_set(self.lcdc, OBJ_SIZE);
-                    let tile_idx = if sprite_mode {
-                        self.oam[addr.wrapping_add(2)] & 0xFE
-                    } else {
-                        self.oam[addr.wrapping_add(2)]
-                    };
-                    let priority = is_bit_set(self.oam[addr.wrapping_add(3)], PRIORITY);
-                    let y_flip = is_bit_set(self.oam[addr.wrapping_add(3)], Y_FLIP);
-                    let x_flip = is_bit_set(self.oam[addr.wrapping_add(3)], X_FLIP);
-                    let palette = is_bit_set(self.oam[addr.wrapping_add(3)], PALETTE);
-
-                    let obj = Object {
-                        x: x_screen,
-                        y: y_screen,
-                        sprite_mode,
-                        tile_idx,
-                        priority,
-                        y_flip,
-                        x_flip,
-                        palette,
-                    };
-
-                    // Check if sprite is 8x8 or 8x16
-                    let offset = if obj.sprite_mode {
-                        16
-                    } else {
-                        8
-                    };
-
-                    // Check if the object intersects the scanline
-                    if y_screen <= self.ly && self.ly <= y_screen + offset {
-                        self.present_objects.push(obj);
-                    }
-                }
-
-                if self.remaining_clock_cycles == 0 {
-                    // Set to mode 3
-                    self.stat = (self.stat & 0xFC) | 3;
-                    self.remaining_clock_cycles = ;
-                }
+                self.mode2();
+                self.wait_mode(cycles);
             }
             3 => {
-                // Render background and window
-                let mut scan_line = [0u32; SCREEN_DIM_X];
-                for x_screen in 0..SCREEN_DIM_X {
-                    let x = self.scx + x_screen;
-                    let y = self.scy + self.ly;
-
-                    render_background_pixel(&mut scan_line, x, y);
-                    render_window_pixel(&mut scan_line, x, y);
-                }
-
-                // Render sprites
-                for obj in &self.present_objects {
-                    obj.priority[]
-
-                    for i in 0..8 {
-                        let x_pixel = (x_screen + i);
-                        let color_id = 
-                        if 0 <= x_pixel && x_pixel < SCREEN_DIM_X {
-                            scan_line[]
-                        }
-                    }
-                }
+                self.mode3();
+                self.wait_mode(cycles);
             }
         }
-        
-        // Copy 
-        window_buffer[]
-
-        self.window.update_with_buffer(
-            &self.window_buffer,
-            SCREEN_DIM_X,
-            SCREEN_DIM_Y,
-        ).unwrap();
     }
 }
