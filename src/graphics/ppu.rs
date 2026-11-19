@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+use std::cmp::{max};
 use minifb::{Window, WindowOptions};
 
 use crate::memory::constants::memory_map::*;
@@ -81,6 +83,12 @@ const Y_FLIP: u8 = 6;
 const X_FLIP: u8 = 5;
 const PALETTE: u8 = 4;
 
+// PPU modes
+const HBLANK: u8 = 0;
+const VBLANK: u8 = 1;
+const OAM_SCAN: u8 = 2;
+const DRAWING: u8 = 3;
+
 struct Object {
     x: i16,
     y: i16,
@@ -94,6 +102,8 @@ struct Object {
 pub struct PictureProcessingUnit {
     // Remaining clock cycles in the current PPU mode.
     remaining_clock_cycles: u16,
+    // Total amount of clock cycles across the scanline.
+    total_clock_cycles: u16,
     // Complete the work for a PPU mode all at once (irregardless of timing). 
     // Then wait through remaining clock cycles.
     wait: bool,
@@ -257,11 +267,7 @@ impl PictureProcessingUnit {
         }
     }
 
-    fn ppu_mode(&self) -> u8
-    {
-        self.stat & 0x03
-    }
-
+    
     fn lcd_enable(&self) -> bool {
         is_bit_set(self.lcdc, LCD_ENABLE)
     }
@@ -293,13 +299,13 @@ impl PictureProcessingUnit {
     fn background_and_window_enable(&self) -> bool {
         is_bit_set(self.lcdc, BACKGROUND_AND_WINDOW_ENABLE)
     }
-
+    
     /// Given a palette and colour ID, returns a 32-bit colour value.
     fn colour(colour_id: u8, palette: u8) -> u32
     {
         let shift = colour_id * 2;
         let gb_colour = palette >> shift & 0x03;
-
+        
         match gb_colour {
             GB_WHITE => FB_WHITE,
             GB_LIGHT_GRAY => FB_LIGHT_GRAY,
@@ -308,7 +314,7 @@ impl PictureProcessingUnit {
             _ => panic!(Invalid Game Boy Colour!),
         }
     }
-
+    
     /// Get the address of the tile with given tile id.
     fn tile_vram_addr(&self, tile_id: u8) -> u16
     {
@@ -327,9 +333,13 @@ impl PictureProcessingUnit {
             }
         }
     }
+    
+    fn ppu_mode(&self) -> u8
+    {
+        self.stat & 0x03
+    }
 
-    /// Returns the colour ID of a pixel in the tile map.
-    fn pixel_id(&self, tile_map_addr: u16, x: u8, y: u8) -> u8
+    fn tile_id(&self, tile_map_addr: u16, x: u8, y: u8) -> u8
     {
         // Index of the tile in the tile map.
         let tile_idx = 
@@ -340,6 +350,13 @@ impl PictureProcessingUnit {
         
         // ID of the tile in tile data block.
         let tile_id = self.vram[addr as usize];
+
+        tile_id
+    }
+
+    /// Returns the colour ID of a pixel in the tile map.
+    fn pixel_id(&self, tile_id: u8, x: u8, y: u8) -> u8
+    {        
         // Address of the tile in the tile data block.
         let tile_addr = self.tile_vram_addr(tile_id);
 
@@ -362,27 +379,16 @@ impl PictureProcessingUnit {
     /// Coordinates are relative to the tile map.
     fn background_pixel_id(&self, x: u8, y: u8) -> u8
     {
-        // Base address of the tile map
-        let tile_map_addr = if self.background_tile_map_select() {
-            TILE_MAP_1_BEGIN
-        } else {
-            TILE_MAP_0_BEGIN
-        };
-        self.pixel_id(tile_map_addr, x, y)
+        let tile_id = self.background_tile_id(x, y);
+        self.pixel_id(tile_id, x, y)
     }
 
     /// Returns the colour ID of specified pixel in the window.
     /// Coordinates are relative to the tile map.
     fn window_pixel_id(&self, x: u8, y: u8) -> u8
     {
-        let tile_map_addr = if self.window_tile_map_select() {
-            // Render window from tile map 1
-            TILE_MAP_1_BEGIN
-        } else {
-            // Render window from tile map 0
-            TILE_MAP_0_BEGIN
-        };
-        self.pixel_id(tile_map_addr, x, y)
+        let tile_id = self.window_tile_id(x, y);
+        self.pixel_id(tile_id, x, y)
     }
 
     /// Returns the colour ID of specified pixel in the object.
@@ -413,6 +419,177 @@ impl PictureProcessingUnit {
         let colour_id = (ms_bit << 1) | ls_bit;
 
         colour_id
+    }
+
+    
+    /// Get the tile ID of the window at coordinate.
+    fn window_tile_id(&self, x: u8, y: u8) -> u8
+    {
+        // Base address of the tile map
+        let tile_map_addr = if self.window_tile_map_select() {
+            TILE_MAP_1_BEGIN
+        } else {
+            TILE_MAP_0_BEGIN
+        };
+        self.tile_id(tile_map_addr, x, y)
+    }
+    
+    /// Get the tile ID of the background at coordinate.
+    fn background_tile_id(&self, x: u8, y: u8) -> u8
+    {
+        // Base address of the tile map
+        let tile_map_addr = if self.background_tile_map_select() {
+            TILE_MAP_1_BEGIN
+        } else {
+            TILE_MAP_0_BEGIN
+        };
+        self.tile_id(tile_map_addr, x, y)
+    }
+    
+    /// Determines the tile ID of the window/background beneath an object.
+    /// Returns (tile ID, source) where source is background = true, 
+    /// window = false.
+    fn object_overlap_tile(&self, screen_x: u8, screen_y: u8) -> (u8, bool)
+    {
+        let x = screen_x + self.scx;
+        let y = screen_y + self.scy;
+
+        let mut tile_id = -1;
+        // Background = true, Window = false.
+        let mut source = true;
+        if self.background_and_window_enable() {
+            // WX register is x position plus 7.
+            let window_x = screen_x as i16 - (self.wx as i16 - 7);
+            let window_y = screen_y as i16 - self.wy as i16;
+            
+            // Check that screen coordinates are in the window area.
+            if self.window_enable() && 
+            window_x >= 0 &&
+            window_y >= 0 {
+                
+                tile_id = 
+                    self.window_tile_id(window_x as u8, window_y as u8) as i16;
+                source = false;
+            } else {
+                tile_id = self.background_tile_id(x, y) as i16;
+                source = true;
+            }
+        }
+
+        // Default to background tile ID if neither the background or window are
+        // drawn underneath.
+        if tile_id == -1 {
+            tile_id = self.background_tile_id(x, y) as i16;
+            source = true;
+        }
+
+        (tile_id as u8, source)
+    }
+    
+    /// Calculate the mode 3 penalty.
+    fn mode3_penalty(&self) -> u8
+    {
+        // Base penalty
+        let mut penalty = 172;
+        
+        // Background scrolling penalty
+        penalty += self.scx % TILE_DIM;
+        
+        // Window penalty
+        if self.background_and_window_enable() && self.window_enable() {
+            penalty += 6;
+        }
+        
+        // Object penalty algorithm
+        let mut tiles = HashSet::new();
+        for obj in &self.objects_in_scanline {
+            if obj.x == 0 {
+                penalty += 11;
+                continue;
+            }
+
+            // Flat 6 dot penalty on all objects.
+            penalty += 6;
+            
+            let x = obj.x + self.scx as i16;
+            let y = obj.y + self.ly as i16;
+            
+            // Check if object origin is in the buffer bounds.
+            if (0 <= x && x < (BUFFER_DIM as i16)) &&
+                (0 <= y && y < (BUFFER_DIM as i16)) {
+                // Tile ID of the background/window beneath the leftmost pixel
+                // of the object.
+                let (tile_id, source) = self.object_overlap_tile(
+                    obj.x as u8, 
+                    obj.y as u8
+                );
+
+                // Only consider each tile once.
+                if tiles.contains(&(tile_id, source)) {
+                    continue;
+                }
+                
+                tiles.insert((tile_id, source));
+
+                // Count number of pixels to the right of the object origin 
+                // within the tile. 
+                let mut right_pixels = if source {
+                    // Background source.
+                    7 - (x % (TILE_DIM as i16))
+                } else {
+                    // Window source.
+                    let window_x = obj.x as i16 - (self.wx as i16 - 7);
+                    7 - (window_x % (TILE_DIM as i16))
+                };
+
+                penalty += max(0, right_pixels - 2) as u8;
+            }
+        }
+        
+        penalty
+    }
+    
+    fn cycles_per_mode(mode: u8) -> u16
+    {
+        match mode {
+            HBLANK => 87,
+            VBLANK => 4560,
+            OAM_SCAN => 80,
+            DRAWING => 172,
+            _ => panic!("Invalid PPU mode!"),
+        }
+    }
+    
+    fn stat_interrupt(&mut self)
+    {
+        let mode = self.ppu_mode();
+        let stat_signal = 
+        (is_bit_set(self.stat, MODE_0_SELECT) && mode == PPUMode::HBlank) ||
+        (is_bit_set(self.stat, MODE_1_SELECT) && mode == PPUMode::VBlank) ||
+        (is_bit_set(self.stat, MODE_2_SELECT) && mode == PPUMode::OAMScan) ||
+        (is_bit_set(self.stat, LYC_SELECT) && self.lyc == self.ly);
+        // Request STAT interrupt if the stat signal goes low to high.
+        if !self.stat_signal && stat_signal {
+            self.interrupt_controller.request_interrupt();
+        }
+        self.stat_signal = stat_signal;
+    }
+
+    /// Wait in between modes.
+    fn wait_mode(&self, cycles: u8)
+    {
+        if self.remaining_clock_cycles <= cycles {
+            self.ppu_mode = (self.ppu_mode + 1) % 4;
+            
+            let remaining_cycles =  cycles - self.remaining_clock_cycles;
+            
+            self.remaining_clock_cycles = Self::cycles_per_mode(self.ppu_mode);
+            
+            // Continue rendering for the number of remaining cycles
+            self.render(remaining_cycles);
+        } else {
+            self.remaining_clock_cycles -= cycles;
+        }
     }
 
     /// PPU mode 2. Save objects present in the current scanline.
@@ -568,56 +745,14 @@ impl PictureProcessingUnit {
 
             self.screen_buffer[self.ly as usize][i] = colour;
         }
-        
-        // Write scanline to screen buffer and output to display.
+
+        // Output the screen buffer to the display.
+        // TODO: This is skipping some of the complexity of pixel FIFO.
         self.window.update_with_buffer(
             self.screen_buffer.as_flattened(),
             SCREEN_DIM_X,
             SCREEN_DIM_Y,
         ).unwrap();
-    }
-
-    fn cycles_per_mode(mode: u8) -> u16
-    {
-        // TODO: These are just baselines, need to include penalty calculation
-        match mode {
-            0 => 87,
-            1 => 4560,
-            2 => 80,
-            3 => 172,
-            _ => panic!("Invalid PPU mode!"),
-        }
-    }
-
-    fn wait_mode(&self, cycles: u8)
-    {
-        if self.remaining_clock_cycles <= cycles {
-            self.ppu_mode = (self.ppu_mode + 1) % 4;
-
-            let remaining_cycles =  cycles - self.remaining_clock_cycles;
-
-            self.remaining_clock_cycles = Self::cycles_per_mode(self.ppu_mode);
-
-            // Continue rendering for the number of remaining cycles
-            self.render(remaining_cycles);
-        } else {
-            self.remaining_clock_cycles -= cycles;
-        }
-    }
-
-    fn stat_interrupt(&mut self)
-    {
-        let mode = self.ppu_mode();
-        let stat_signal = 
-            (is_bit_set(self.stat, MODE_0_SELECT) && mode == 0) ||
-            (is_bit_set(self.stat, MODE_1_SELECT) && mode == 1) ||
-            (is_bit_set(self.stat, MODE_2_SELECT) && mode == 2) ||
-            (is_bit_set(self.stat, LYC_SELECT) && self.lyc == self.ly);
-        // Request STAT interrupt if the stat signal goes low to high.
-        if !self.stat_signal && stat_signal {
-            self.interrupt_controller.request_interrupt();
-        }
-        self.stat_signal = stat_signal;
     }
     
     pub fn render(&mut self, cycles: u8) 
@@ -632,20 +767,23 @@ impl PictureProcessingUnit {
         self.stat_interrupt();
 
         match self.ppu_mode() {
-            0 => {
-
+            HBLANK => {
+                // Waiting until the end of the scanline.
             }
-            1 => {
-                
+            VBLANK => {
+                // Waiting until the next frame.
             }
-            2 => {
+            OAM_SCAN => {
+                // Searching for objects which overlap the line.
+                self.wait_mode(cycles);
                 self.mode2();
-                self.wait_mode(cycles);
             }
-            3 => {
+            DRAWING => {
+                // Sending background, window, and object pixels to the LCD.
+                self.wait_mode(cycles);
                 self.mode3();
-                self.wait_mode(cycles);
             }
+            _ => panic!("Invalid PPU mode!")
         }
     }
 }
